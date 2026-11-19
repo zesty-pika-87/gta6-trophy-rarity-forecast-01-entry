@@ -1,0 +1,253 @@
+"""GTA VI trophy rarity forecast (make.fun gta6-trophy-rarity-forecast-01).
+
+Forecasts each trophy's Exophase earn rate at the case's target as five
+quantiles, from the case's own history only. Python 3.13, standard library.
+
+Method
+------
+A trophy's earn rate is a ratio, rate = E / N: E is the cumulative count of
+tracked players who earned the trophy, N the players tracked. Exophase
+refreshes both counts on its own schedule (hours apart), so the history is
+a staircase: long flat stretches, then a jump. Two consequences drive the
+design:
+
+1. Only *distinct* states carry information. Repeated reads of the same
+   page are one observation, not many. Fitting a trend through the flat
+   stretches as if they were many points would overweight the stale state.
+2. The launch-night state is a different regime. The first refresh jumped
+   N from 638 to 3,868 and cut every rate but the 100% one roughly fivefold:
+   a tiny early-adopter sample, then the launch crowd. A line fitted
+   through that step extrapolates the step as a trend and keeps pushing
+   rates down forever (on the practice backtest it scores far worse than
+   persistence). So when the first distinct state is dwarfed by the next
+   one (N more than tripled), it is dropped before any fit.
+
+For each trophy the median is a damped, shrunk power law in log-time:
+
+    ln(rate) = a + b * ln(1 + hours since release day began)
+
+fitted by least squares on the distinct states of the last 48 hours
+(all of them when there are fewer). The slope b is the trophy's own
+maturity speed: early story trophies (Chapter 1, fishing) have b > 0,
+their earners catch up faster than new players join; grind trophies
+(platinum, 250 stunts, 100% completion) have b < 0, dilution wins. Two
+guards keep the extrapolation honest:
+
+- damping: b is multiplied by 0.6. A slope fitted over hours of noisy
+  refresh steps overstates how far a rate travels over days; the
+  adoption curve saturates, it does not run on a straight line in
+  log-time.
+- shrinkage: b is pulled 30% toward the mean slope across trophies.
+  A trophy with two or three noisy states does not get to keep an
+  extreme slope of its own.
+
+With fewer than three distinct states there is no slope to fit and the
+median is the last rate (persistence). The trophy at 100% (every tracked
+player has it at every read) is forecast at 100% flat: its logit is
+unbounded and any spread below 100 pays heavily if the rate stays 100.
+
+The spread is honest about a 4.5-day extrapolation from ~2 days of
+staircase data. Per trophy, in logit units:
+
+    s^2 = (0.5 * sqrt(days))^2 + s_refresh^2 + resid^2
+
+the house random-walk term, a refresh-surprise term (one discrete
+refresh can move a rate by ~a logit; the practice straddles exactly
+one: 1.0 when no trend could be fitted at all, 0.7 once a fit absorbs
+part of the refresh dynamics), and the trophy's own fit residual (0
+when there is no fit).
+Quantiles are the median shifted by z_tau * s on the logit scale,
+clamped to [0.01, 99.99] and rounded to 4 decimals, non-decreasing.
+
+Any failure of the fit for a trophy falls back to persistence with the
+same spread, so the program always writes a valid forecast.
+"""
+
+import json
+import math
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# The grader's -P leaves /bot off sys.path: put it back first.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z = [-1.645, -0.674, 0, 0.674, 1.645]
+
+# Slope damping (see module docstring) and shrinkage toward the mean slope.
+DAMP = 0.6
+SHRINK = 0.3
+# Spread: refresh-surprise term, in logit units. Wider when no trend could
+# be fitted at all (a flat history leaves the next refresh wholly
+# unmodelled); narrower once a fit absorbs part of the refresh dynamics.
+REFRESH_SIGMA_FIT = 0.7
+REFRESH_SIGMA_NOFIT = 1.0
+# Random-walk spread per square-root day, as in the house baseline.
+RW_SIGMA = 0.5
+# Only states from the last 48 hours before the checkpoint enter the fit.
+FIT_WINDOW_HOURS = 48.0
+# Drop the leading distinct state when the next one tracks >3x the players.
+REGIME_JUMP = 3.0
+# Sanity guard on the median's total move from the last rate.
+MAX_MOVE = 10.0
+MIN_MOVE = 0.1
+
+
+def clamp(x: float) -> float:
+    return min(99.99, max(0.01, x))
+
+
+def logit(pct: float) -> float:
+    p = clamp(pct)
+    return math.log(p / (100 - p))
+
+
+def inv_logit(lg: float) -> float:
+    return 100 / (1 + math.exp(-lg))
+
+
+def round4(x: float):
+    scaled = x * 10000
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    value = whole / 10000
+    return int(value) if value == int(value) else value
+
+
+def parse_time(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def linfit(xs, ys):
+    """Least squares y = a + b*x. Returns (a, b, residual_std)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    den = sum((x - mx) ** 2 for x in xs)
+    if den == 0:
+        return my, 0.0, 0.0
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+    a = my - b * mx
+    resid = 0.0
+    if n > 2:
+        resid = math.sqrt(sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / (n - 2))
+    return a, b, resid
+
+
+def distinct_states(history):
+    """Collapse consecutive identical reads (same N and rates) to one state."""
+    states = []
+    last_key = None
+    for h in history:
+        key = (h["players_tracked"], tuple(h["rates"]))
+        if key != last_key:
+            states.append(h)
+            last_key = key
+    return states
+
+
+def forecast_case(case: dict, name: str) -> dict:
+    if case["levels"] != LEVELS:
+        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
+    if not case["history"]:
+        raise ValueError(f"{name} has no history")
+    trophies = case["trophies"]
+    horizon_days = case["horizon_minutes"] / 1440.0
+    target = parse_time(case["target"])
+    checkpoint = parse_time(case["at"])
+
+    # Time origin: the start of release day, from the case's game record.
+    release = case.get("game", {}).get("release_date", "2026-11-19")
+    origin = datetime.fromisoformat(release + "T00:00:00+00:00").astimezone(timezone.utc)
+
+    def x_of(dt: datetime) -> float:
+        hours = (dt - origin).total_seconds() / 3600.0
+        return math.log(1 + max(hours, 0.0))
+
+    x_target = x_of(target)
+    states = distinct_states(case["history"])
+
+    # Drop the launch-night regime: a leading state dwarfed by the next one.
+    while len(states) >= 2 and states[1]["players_tracked"] > REGIME_JUMP * max(states[0]["players_tracked"], 1):
+        states = states[1:]
+
+    # Fit window: distinct states from the last 48 h before the checkpoint.
+    window_start = checkpoint.timestamp() - FIT_WINDOW_HOURS * 3600
+    fit_states = [s for s in states if parse_time(s["at"]).timestamp() >= window_start]
+    if len(fit_states) < 3:
+        fit_states = states
+
+    xs = [x_of(parse_time(s["at"])) for s in fit_states]
+    last = case["history"][-1]
+    rw = RW_SIGMA * math.sqrt(horizon_days)
+
+    # First pass: per-trophy slopes, to get the mean slope for shrinkage.
+    fits = {}
+    slopes = []
+    for i, trophy in enumerate(trophies):
+        ys = []
+        ok = True
+        for s in fit_states:
+            r = s["rates"][i]
+            if r is None:
+                ok = False
+                break
+            ys.append(math.log(max(r, 0.01)))
+        if not ok or len(xs) < 3:
+            continue
+        a, b, resid = linfit(xs, ys)
+        fits[trophy["id"]] = (a, b, resid)
+        slopes.append(b)
+    mean_slope = sum(slopes) / len(slopes) if slopes else 0.0
+
+    rows = []
+    for i, trophy in enumerate(trophies):
+        tid = trophy["id"]
+        last_rate = last["rates"][i]
+        if last_rate is None:
+            last_rate = 0.01
+        # The trophy every tracked player holds: forecast 100% flat.
+        if last_rate >= 99.99:
+            rows.append({"id": tid, "q": [100, 100, 100, 100, 100]})
+            continue
+        fit = fits.get(tid)
+        if fit is None:
+            median = last_rate
+            resid = 0.0
+            refresh_sigma = REFRESH_SIGMA_NOFIT
+        else:
+            a, b, resid = fit
+            b_adj = DAMP * ((1 - SHRINK) * b + SHRINK * mean_slope)
+            median = math.exp(a + b_adj * x_target)
+            median = min(max(median, last_rate * MIN_MOVE), last_rate * MAX_MOVE)
+            median = clamp(median)
+            refresh_sigma = REFRESH_SIGMA_FIT
+        spread = math.sqrt(rw * rw + refresh_sigma * refresh_sigma + min(resid, 1.0) ** 2)
+        lg = logit(median)
+        qs = [round4(clamp(inv_logit(lg + z * spread))) for z in Z]
+        # Guarantee non-decreasing after rounding.
+        for j in range(1, 5):
+            if qs[j] < qs[j - 1]:
+                qs[j] = qs[j - 1]
+        rows.append({"id": tid, "q": qs})
+    return {"trophies": rows}
+
+
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(INPUT_DIR.glob("*.in")):
+        case = json.loads(path.read_text(encoding="utf-8"))
+        forecast = forecast_case(case, path.name)
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+
+
+if __name__ == "__main__":
+    main()
