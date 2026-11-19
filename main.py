@@ -262,8 +262,11 @@ def forecast_case(case: dict, name: str) -> dict:
             median = clamp(median)
             refresh_sigma = REFRESH_SIGMA_FIT
         spread = math.sqrt(rw * rw + refresh_sigma * refresh_sigma + min(resid, 1.0) ** 2)
-        lg = logit(median)
-        qs = [round4(clamp(inv_logit(lg + z * spread))) for z in Z]
+        lg = logit(median) + MEDIAN_SHIFT
+        qs = []
+        for z in Z:
+            sz = spread * (SPREAD_DOWN if z < 0 else SPREAD_UP if z > 0 else 1.0)
+            qs.append(round4(clamp(inv_logit(lg + z * sz))))
         # Guarantee non-decreasing after rounding.
         for j in range(1, 5):
             if qs[j] < qs[j - 1]:
