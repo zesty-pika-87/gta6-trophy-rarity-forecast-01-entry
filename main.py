@@ -60,6 +60,13 @@ part of the refresh dynamics), and the trophy's own fit residual (0
 when there is no fit).
 Quantiles are the median shifted by z_tau * s on the logit scale,
 clamped to [0.01, 99.99] and rounded to 4 decimals, non-decreasing.
+Two corrections for the one-sided refresh dynamics, verified on the
+DEV/B1/B2/B3 backtests: the median itself is shifted down 0.2 logit,
+and the spread is asymmetric — 1.5x for the lower quantiles (z < 0),
+0.5x for the upper quantiles (z > 0), 1.0x at the median. A refresh
+dilutes rates one way only (N jumps, E lags), so the median is biased
+high — the damped trend under-predicts the decline — and forecast
+errors around the median skew downward. The 100% trophy stays flat.
 
 Any failure of the fit for a trophy falls back to persistence with the
 same spread, so the program always writes a valid forecast.
@@ -91,6 +98,14 @@ REFRESH_SIGMA_FIT = 0.7
 REFRESH_SIGMA_NOFIT = 1.0
 # Random-walk spread per square-root day, as in the house baseline.
 RW_SIGMA = 0.5
+# Median shift (logit): refreshes dilute rates one-sidedly and the damped
+# trend under-predicts the decline, so the median is biased high; shift it
+# down 0.2 logit (~x0.82 in rate). Asymmetric spread: forecast errors
+# around the median are downside-heavy (dilution), so the lower quantiles
+# get 1.5x spread and the upper quantiles 0.5x.
+MEDIAN_SHIFT = -0.2
+SPREAD_DOWN = 1.5
+SPREAD_UP = 0.5
 # Only states from the last 48 hours before the checkpoint enter the fit.
 FIT_WINDOW_HOURS = 48.0
 # Drop the leading distinct state when the next one tracks >3x the players.
