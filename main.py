@@ -27,8 +27,10 @@ For each trophy the median is a damped, shrunk power law in log-time:
     ln(rate) = a + b * ln(1 + hours since release day began)
 
 fitted by least squares on the distinct states of the last 48 hours
-(all of them when there are fewer). The slope b is the trophy's own
-maturity speed: early story trophies (Chapter 1, fishing) have b > 0,
+(all of them when there are fewer), weighted by recency with a 24-hour
+half-life: the regime drifts as the launch crowd matures, so a refresh
+from this morning constrains the slope more than one from yesterday.
+The slope b is the trophy's own maturity speed: early story trophies (Chapter 1, fishing) have b > 0,
 their earners catch up faster than new players join; grind trophies
 (platinum, 250 stunts, 100% completion) have b < 0, dilution wins. Two
 guards keep the extrapolation honest:
@@ -124,19 +126,30 @@ def parse_time(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def linfit(xs, ys):
-    """Least squares y = a + b*x. Returns (a, b, residual_std)."""
+def linfit(xs, ys, ws=None):
+    """Weighted least squares y = a + b*x. Returns (a, b, residual_std).
+
+    Weights default to 1. The caller passes recency weights: the regime
+    drifts (launch-night players mature, the crowd changes), so a
+    refresh from yesterday constrains the slope less than one from
+    this morning.
+    """
     n = len(xs)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    den = sum((x - mx) ** 2 for x in xs)
+    if ws is None:
+        ws = [1.0] * n
+    sw = sum(ws)
+    mx = sum(w * x for w, x in zip(ws, xs)) / sw
+    my = sum(w * y for w, y in zip(ws, ys)) / sw
+    den = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
     if den == 0:
         return my, 0.0, 0.0
-    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+    b = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys)) / den
     a = my - b * mx
     resid = 0.0
     if n > 2:
-        resid = math.sqrt(sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / (n - 2))
+        resid = math.sqrt(
+            sum(w * (y - (a + b * x)) ** 2 for w, x, y in zip(ws, xs, ys)) / sw
+        )
     return a, b, resid
 
 
@@ -184,6 +197,11 @@ def forecast_case(case: dict, name: str) -> dict:
         fit_states = states
 
     xs = [x_of(parse_time(s["at"])) for s in fit_states]
+    # Recency weights: half-life 24 h back from the checkpoint.
+    ws = [
+        0.5 ** ((checkpoint - parse_time(s["at"])).total_seconds() / (24 * 3600))
+        for s in fit_states
+    ]
     last = case["history"][-1]
     rw = RW_SIGMA * math.sqrt(horizon_days)
 
@@ -201,7 +219,7 @@ def forecast_case(case: dict, name: str) -> dict:
             ys.append(math.log(max(r, 0.01)))
         if not ok or len(xs) < 3:
             continue
-        a, b, resid = linfit(xs, ys)
+        a, b, resid = linfit(xs, ys, ws)
         fits[trophy["id"]] = (a, b, resid)
         slopes.append(b)
     mean_slope = sum(slopes) / len(slopes) if slopes else 0.0
